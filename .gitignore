@@ -1,0 +1,10 @@
+.env
+__pycache__/
+*.pyc
+screenshots/
+gem-detection-handoff.md
+.venv-proto/
+# Only proto/*.py is tracked; everything else in proto/ is generated output.
+proto/*.png
+proto/*.log
+proto/loop_run/
