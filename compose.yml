@@ -4,7 +4,7 @@ services:
     restart: unless-stopped
     environment:
       - ADB_SERVER_SOCKET=tcp:droidctrl:5037
-      - POLL_INTERVAL=${POLL_INTERVAL:-300}
+      - POLL_INTERVAL=${POLL_INTERVAL:-10}
       - TARGETS=${TARGETS:-claim,retry}
       - MIN_CONFIDENCE=${MIN_CONFIDENCE:-80}
       - SCALE=${SCALE:-3}

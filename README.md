@@ -7,8 +7,8 @@ Autoclicker for **The Tower** by Tech Tree Games (Android). Sits next to an
 - Taps **RETRY** when a run ends, so the next run starts without you.
 
 Screenshots the phone via ADB, OCRs the image with Tesseract, and taps the
-centroid of the first matching label. Default poll interval is 5 minutes —
-low enough to catch a gem before it times out, high enough to not look busy.
+centroid of the first matching label. Default poll interval is 10 seconds —
+low enough to catch a CLAIM before it times out.
 
 ## Why OCR instead of accessibility / hooking
 
@@ -59,7 +59,7 @@ network and the ADB server on `droidctrl:5037` exist).
 | Variable | Meaning | Default |
 |----------|---------|---------|
 | `ADB_KEY_DIR` | Host path containing `adbkey` + `adbkey.pub` | `$HOME/.android` |
-| `POLL_INTERVAL` | Seconds between screenshot polls | `300` |
+| `POLL_INTERVAL` | Seconds between screenshot polls | `10` |
 | `TARGETS` | Comma-separated button labels (priority order) | `claim,retry` |
 | `MIN_CONFIDENCE` | Tesseract confidence threshold (0–100) | `80` |
 | `SCALE` | Screenshot upscale factor before OCR | `3` |
@@ -121,7 +121,7 @@ screenshots/OCR passes.
 
 ## Tuning
 
-- **Misses CLAIM**: drop `POLL_INTERVAL` to 60–120 (more screenshots = more
+- **Misses CLAIM**: drop `POLL_INTERVAL` to 5 (more screenshots = more
   CPU but catches faster-expiring drops). Or lower `MIN_CONFIDENCE` to
   50–70 if Tesseract's reading the stylized font below threshold.
 - **False taps**: raise `MIN_CONFIDENCE` back toward 80–90. If a cosmetic

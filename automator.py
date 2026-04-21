@@ -15,7 +15,7 @@ import time
 from PIL import Image, ImageFilter
 import pytesseract
 
-POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "300"))
+POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
 TARGETS = [t.strip().lower() for t in os.environ.get("TARGETS", "claim,retry").split(",") if t.strip()]
 MIN_CONFIDENCE = int(os.environ.get("MIN_CONFIDENCE", "80"))
 SCALE = int(os.environ.get("SCALE", "3"))
