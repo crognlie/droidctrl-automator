@@ -1,0 +1,19 @@
+services:
+  automator:
+    build: .
+    restart: unless-stopped
+    environment:
+      - ADB_SERVER_SOCKET=tcp:droidctrl:5037
+      - POLL_INTERVAL=${POLL_INTERVAL:-300}
+      - TARGETS=${TARGETS:-claim,retry}
+      - MIN_CONFIDENCE=${MIN_CONFIDENCE:-80}
+      - SCALE=${SCALE:-3}
+    volumes:
+      - ${ADB_KEY_DIR:-${HOME}/.android}/adbkey:/root/.android/adbkey:ro
+      - ${ADB_KEY_DIR:-${HOME}/.android}/adbkey.pub:/root/.android/adbkey.pub:ro
+
+# Join the network droidctrl is on, so we can reach its ADB server.
+networks:
+  default:
+    name: ${NETWORK:-droidctrl_default}
+    external: true
