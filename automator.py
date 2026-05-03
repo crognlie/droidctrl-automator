@@ -177,26 +177,20 @@ def run():
             img_pil = bgr_to_pil(img_bgr)
 
             if tower is not None:
-                # In-game: gem + CLAIM are the safe targets.
                 tap_pos = try_gem(img_bgr, tower)
                 if tap_pos:
                     tap(*tap_pos)
                     time.sleep(POLL_INTERVAL)
                     continue
 
-                claim_pos = ocr_find(img_pil, "claim")
-                if claim_pos:
-                    print(f"[+] 'claim' at {claim_pos} — tapping", flush=True)
-                    tap(*claim_pos)
-                    time.sleep(POLL_INTERVAL)
-                    continue
+            claim_pos = ocr_find(img_pil, "claim")
+            if claim_pos:
+                print(f"[+] 'claim' at {claim_pos} — tapping", flush=True)
+                tap(*claim_pos)
+                time.sleep(POLL_INTERVAL)
+                continue
 
-                print("[-] No targets found", flush=True)
-            else:
-                # No tower visible → likely a menu / death screen. Only
-                # fire clicks for explicit text we recognize. Gem detection
-                # and CLAIM OCR are disabled because their centroids could
-                # land on arbitrary menu buttons.
+            if tower is None:
                 retry_pos = ocr_find(img_pil, "retry")
                 if retry_pos:
                     if not RETRY_WEBHOOK:
