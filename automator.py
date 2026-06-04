@@ -35,6 +35,7 @@ import gem
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
 RETRY_INTERVAL = int(os.environ.get("RETRY_INTERVAL", "300"))
 RETRY_WAIT = int(os.environ.get("RETRY_WAIT", "180"))
+LAUNCH_WAIT = int(os.environ.get("LAUNCH_WAIT", "30"))
 RETRY_WEBHOOK = os.environ.get("RETRY_WEBHOOK", "")
 RETRY_WEBHOOK_MESSAGE = os.environ.get(
     "RETRY_WEBHOOK_MESSAGE",
@@ -44,6 +45,9 @@ RETRY_WEBHOOK_AVATAR = os.environ.get(
     "RETRY_WEBHOOK_AVATAR",
     "https://raw.githubusercontent.com/crognlie/droidctrl/main/favicons/novnc-64x64.png",
 )
+TOWER_PACKAGE = "com.TechTreeGames.TheTower"
+TOWER_ACTIVITY = f"{TOWER_PACKAGE}/com.unity3d.player.UnityPlayerActivity"
+
 MIN_CONFIDENCE = int(os.environ.get("MIN_CONFIDENCE", "80"))
 SCALE = int(os.environ.get("SCALE", "3"))
 
@@ -93,6 +97,18 @@ def ocr_find(img_pil, word):
             cy = (data["top"][i] + data["height"][i] // 2) // SCALE
             return (cx, cy)
     return None
+
+
+def is_tower_focused():
+    r = subprocess.run(
+        ["adb", "shell", "dumpsys", "window"],
+        capture_output=True, text=True, timeout=5,
+    )
+    return any(
+        TOWER_PACKAGE in line
+        for line in r.stdout.splitlines()
+        if "mCurrentFocus" in line
+    )
 
 
 def tap(x, y):
@@ -172,6 +188,20 @@ def run():
 
     while True:
         try:
+            if not is_tower_focused():
+                print(f"[-] Tower not in foreground — going home then launching, waiting {LAUNCH_WAIT}s", flush=True)
+                subprocess.run(
+                    ["adb", "shell", "input", "keyevent", "KEYCODE_HOME"],
+                    timeout=5, capture_output=True,
+                )
+                time.sleep(1)
+                subprocess.run(
+                    ["adb", "shell", "am", "start", "-n", TOWER_ACTIVITY],
+                    timeout=5, capture_output=True,
+                )
+                time.sleep(LAUNCH_WAIT)
+                continue
+
             img_bgr = gem.screencap_raw()
             tower = gem.find_tower_center(img_bgr)
             img_pil = bgr_to_pil(img_bgr)
@@ -182,6 +212,8 @@ def run():
                     tap(*tap_pos)
                     time.sleep(POLL_INTERVAL)
                     continue
+            else:
+                print("[-] No tower center found", flush=True)
 
             claim_pos = ocr_find(img_pil, "claim")
             if claim_pos:
@@ -199,12 +231,16 @@ def run():
                     else:
                         now = time.monotonic()
                         if retry_time == 0.0:
-                            retry_time = now
-                            print(
-                                f"[+] 'retry' found at {retry_pos} — waiting {RETRY_WAIT}s before clicking",
-                                flush=True,
-                            )
                             send_retry_webhook(img_pil)
+                            if RETRY_WAIT == 0:
+                                print(f"[+] 'retry' at {retry_pos} — tapping immediately", flush=True)
+                                tap(*retry_pos)
+                            else:
+                                retry_time = now
+                                print(
+                                    f"[+] 'retry' found at {retry_pos} — waiting {RETRY_WAIT}s before clicking",
+                                    flush=True,
+                                )
                         elif now - retry_time >= RETRY_WAIT:
                             print(f"[+] 'retry' at {retry_pos} — tapping after {now - retry_time:.0f}s", flush=True)
                             tap(*retry_pos)
@@ -215,7 +251,11 @@ def run():
                                 flush=True,
                             )
                 else:
-                    print("[-] No tower — menu mode, no retry found", flush=True)
+                    if retry_time != 0.0:
+                        print("[-] retry screen gone — resetting timer", flush=True)
+                        retry_time = 0.0
+                    else:
+                        print("[-] No tower — menu mode, no retry found", flush=True)
 
         except Exception as e:
             print(f"[!] {e}", flush=True)
