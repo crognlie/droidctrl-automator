@@ -186,11 +186,11 @@ def backup_loop():
 
 
 def run():
+    wait_for_device()
+
     if BACKUP_DIR:
         print(f"[*] Starting backup loop (every {BACKUP_INTERVAL}s → {BACKUP_DIR})", flush=True)
         threading.Thread(target=backup_loop, daemon=True).start()
-
-    wait_for_device()
     print(
         f"[*] Automator started — poll every {POLL_INTERVAL}s "
         f"(retry_wait={RETRY_WAIT}s, gem min_score={GEM_MIN_SCORE}, "
