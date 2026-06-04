@@ -17,6 +17,8 @@ services:
       - GEM_RADIUS_MAX=${GEM_RADIUS_MAX:-360}
       - GEM_PERIOD=${GEM_PERIOD:-12.0}
       - PIPELINE_LATENCY=${PIPELINE_LATENCY:-0.9}
+      - BACKUP_DIR=${BACKUP_DIR:-}
+      - BACKUP_INTERVAL=${BACKUP_INTERVAL:-300}
     volumes:
       - ${ADB_KEY_DIR:-${HOME}/.android}/adbkey:/root/.android/adbkey:ro
       - ${ADB_KEY_DIR:-${HOME}/.android}/adbkey.pub:/root/.android/adbkey.pub:ro
@@ -25,6 +27,8 @@ services:
       # bakes a working fallback into the image for fresh `up`s.
       - ./automator.py:/automator.py:ro
       - ./gem.py:/gem.py:ro
+      - ./backup.py:/backup.py:ro
+      - ${BACKUP_DIR:-/tmp/automator-backup}:/backup
 
 # Join the network droidctrl is on, so we can reach its ADB server.
 networks:

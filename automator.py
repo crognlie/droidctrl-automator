@@ -21,6 +21,7 @@ sprite with no text so it needs shape-based detection.
 import io
 import os
 import subprocess
+import threading
 import time
 
 import requests
@@ -45,6 +46,9 @@ RETRY_WEBHOOK_AVATAR = os.environ.get(
     "RETRY_WEBHOOK_AVATAR",
     "https://raw.githubusercontent.com/crognlie/droidctrl/main/favicons/novnc-64x64.png",
 )
+BACKUP_DIR = os.environ.get("BACKUP_DIR", "")
+BACKUP_INTERVAL = int(os.environ.get("BACKUP_INTERVAL", "300"))
+
 TOWER_PACKAGE = "com.TechTreeGames.TheTower"
 TOWER_ACTIVITY = f"{TOWER_PACKAGE}/com.unity3d.player.UnityPlayerActivity"
 
@@ -175,7 +179,17 @@ def send_retry_webhook(img_pil):
         print(f"[!] webhook failed: {e}", flush=True)
 
 
+def backup_loop():
+    while True:
+        subprocess.run(["python3", "/backup.py"], check=False)
+        time.sleep(BACKUP_INTERVAL)
+
+
 def run():
+    if BACKUP_DIR:
+        print(f"[*] Starting backup loop (every {BACKUP_INTERVAL}s → {BACKUP_DIR})", flush=True)
+        threading.Thread(target=backup_loop, daemon=True).start()
+
     wait_for_device()
     print(
         f"[*] Automator started — poll every {POLL_INTERVAL}s "
