@@ -39,9 +39,10 @@ MAX_SIDE_RATIO = 1.35
 # Max deviation from 90° at each corner.
 MAX_ANGLE_DEV_DEG = 22
 
-# Max contour circularity (4πA/P²). A square outline is ~0.78; the common
-# "circle + 4 cardinal nubs" healing enemy is 0.79+, so cut at 0.77.
-MAX_CIRCULARITY = 0.77
+# Max contour circularity (4πA/P²). The floating gem is a rotated square
+# outline (~0.785); healing enemies (circle + 4 nubs) are ~0.79+. Raised to
+# 0.85 to let the gem through; interior density filter catches hollow enemies.
+MAX_CIRCULARITY = 0.85
 
 # Fraction of contour points that must lie within CONTOUR_MATCH_DIST of a
 # fitted-rectangle edge. Rotation-invariant (no rasterization artifacts).
