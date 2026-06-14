@@ -5,7 +5,6 @@ services:
     environment:
       - ADB_SERVER_SOCKET=tcp:droidctrl:5037
       - POLL_INTERVAL=${POLL_INTERVAL:-10}
-      - RETRY_INTERVAL=${RETRY_INTERVAL:-300}
       - RETRY_WAIT=${RETRY_WAIT:-180}
       - RETRY_WEBHOOK=${RETRY_WEBHOOK:-}
       - RETRY_WEBHOOK_MESSAGE=${RETRY_WEBHOOK_MESSAGE:-}
@@ -13,12 +12,11 @@ services:
       - MIN_CONFIDENCE=${MIN_CONFIDENCE:-80}
       - SCALE=${SCALE:-3}
       - GEM_MIN_SCORE=${GEM_MIN_SCORE:-0.70}
-      - GEM_RADIUS_MIN=${GEM_RADIUS_MIN:-280}
-      - GEM_RADIUS_MAX=${GEM_RADIUS_MAX:-360}
+      - GEM_RADIUS_MIN=${GEM_RADIUS_MIN:-190}
+      - GEM_RADIUS_MAX=${GEM_RADIUS_MAX:-265}
       - GEM_PERIOD=${GEM_PERIOD:-12.0}
       - PIPELINE_LATENCY=${PIPELINE_LATENCY:-0.9}
       - BACKUP_DIR=${BACKUP_DIR:-}
-      - BACKUP_INTERVAL=${BACKUP_INTERVAL:-300}
     volumes:
       - ${ADB_KEY_DIR:-${HOME}/.android}/adbkey:/root/.android/adbkey:ro
       - ${ADB_KEY_DIR:-${HOME}/.android}/adbkey.pub:/root/.android/adbkey.pub:ro
