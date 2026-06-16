@@ -7,8 +7,8 @@ appear at any rotation — this detector is rotation-invariant via
 cv2.minAreaRect + circularity filter + contour-to-edge alignment.
 
 Also provides:
-- find_tower_center(): cyan-ring Hough circle for the constant tower
-  landmark (needed because the bottom menu shifts the tower when open).
+- find_tower_center(): grayscale Hough circle on the orbit ring to locate
+  the tower center (needed because the bottom menu shifts the tower when open).
 - screencap_raw():     ~2x faster than `screencap -p` since it skips
   on-device PNG encoding.
 - predict_tap(): extrapolate the gem's orbital position forward to
@@ -186,26 +186,37 @@ def detect_gem(img_bgr):
 
 # ---------- tower center ----------
 
-# Cyan / teal range for the tower's concentric rings.
-CYAN_LO = np.array([80, 100, 150])
-CYAN_HI = np.array([100, 255, 255])
-
 
 def find_tower_center(img_bgr):
-    """Top-ranked cyan ring → tower center, or None if not found."""
-    hsv = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2HSV)
-    mask = cv2.inRange(hsv, CYAN_LO, CYAN_HI)
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k, iterations=1)
-    blurred = cv2.GaussianBlur(mask, (9, 9), 2)
+    """Orbit-ring Hough circle → tower center, or None if not found.
+
+    Detects the orbit ring the gem travels along. Color-agnostic (grayscale).
+    Filters to circles whose center x is within 5% of the screen's horizontal
+    midpoint and whose ring fits entirely within the image. Among candidates,
+    picks the largest ring (orbit ring dominates). Radius range: 16%–50% of
+    screen width.
+    """
+    h, w = img_bgr.shape[:2]
+    cx_screen = w / 2
+    gray = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2GRAY)
+    blurred = cv2.GaussianBlur(gray, (9, 9), 2)
     circles = cv2.HoughCircles(
-        blurred, cv2.HOUGH_GRADIENT, dp=1, minDist=200,
-        param1=80, param2=30, minRadius=80, maxRadius=400,
+        blurred, cv2.HOUGH_GRADIENT, dp=2, minDist=400,
+        param1=60, param2=80, minRadius=w * 16 // 100, maxRadius=w // 2,
     )
     if circles is None:
         return None
-    c = circles[0][0]
-    return int(round(c[0])), int(round(c[1]))
+    tolerance = w * 0.05
+    candidates = [
+        c for c in circles[0]
+        if abs(c[0] - cx_screen) <= tolerance  # horizontally centered
+        and c[2] <= c[0] <= w - c[2]           # fits within image width
+        and c[2] <= c[1] <= h - c[2]           # fits within image height
+    ]
+    if not candidates:
+        return None
+    c = max(candidates, key=lambda c: c[2])  # largest on-screen ring = orbit ring
+    return int(round(c[0])), int(round(c[1])), int(round(c[2]))
 
 
 # ---------- prediction ----------

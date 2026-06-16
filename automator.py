@@ -31,7 +31,7 @@ import requests
 import cv2
 import numpy as np
 import pytesseract
-from PIL import Image, ImageFilter
+from PIL import Image, ImageDraw, ImageFilter
 
 import gem
 
@@ -59,8 +59,6 @@ MIN_CONFIDENCE = int(os.environ.get("MIN_CONFIDENCE", "80"))
 SCALE = int(os.environ.get("SCALE", "3"))
 
 GEM_MIN_SCORE = float(os.environ.get("GEM_MIN_SCORE", "0.70"))
-GEM_RADIUS_MIN = int(os.environ.get("GEM_RADIUS_MIN", "280"))
-GEM_RADIUS_MAX = int(os.environ.get("GEM_RADIUS_MAX", "360"))
 GEM_PERIOD = float(os.environ.get("GEM_PERIOD", "12.0"))
 # Image-capture-to-tap latency (seconds). The gem moves at 2π·radius /
 # period ≈ 160 px/s on a 1080x2400 frame, so a ~900 ms latency requires
@@ -106,12 +104,13 @@ def ocr_find(img_pil, word):
     return None
 
 
-def ocr_find_in_region(img_pil, word, x_frac=0.0, y_frac=0.0):
-    """Like ocr_find but restricted to the region [x_frac*w:, y_frac*h:].
+def ocr_find_in_region(img_pil, word, x0_frac=0.0, y0_frac=0.0, x1_frac=1.0, y1_frac=1.0):
+    """Like ocr_find but restricted to a fractional region of the image.
     Returns coordinates in full-image space."""
     w, h = img_pil.size
-    x0, y0 = int(w * x_frac), int(h * y_frac)
-    crop = img_pil.crop((x0, y0, w, h))
+    x0, y0 = int(w * x0_frac), int(h * y0_frac)
+    x1, y1 = int(w * x1_frac), int(h * y1_frac)
+    crop = img_pil.crop((x0, y0, x1, y1))
     pos = ocr_find(crop, word)
     if pos is None:
         return None
@@ -135,7 +134,7 @@ def tap(x, y):
 
 
 def exit_tower():
-    """Press Home, wait for playerInfo.dat to update (game saved), then kill."""
+    """Press Home and wait for playerInfo.dat to update (game saved)."""
     def get_mtime():
         r = subprocess.run(["adb", "shell", "stat", "-c", "%Y", PLAYERINFO_SRC],
                            capture_output=True, text=True, timeout=5)
@@ -145,26 +144,30 @@ def exit_tower():
             return 0
 
     mtime_before = get_mtime()
-    print("[*] restart: pressing Home — waiting for game to save", flush=True)
+    print("[*] exit_tower: pressing Home — waiting for game to save", flush=True)
     subprocess.run(["adb", "shell", "input", "keyevent", "KEYCODE_HOME"],
                    capture_output=True, timeout=5)
     for _ in range(10):
         time.sleep(1)
         if get_mtime() > mtime_before:
-            print("[*] restart: save detected — killing process", flush=True)
-            break
-    else:
-        print("[!] restart: no save detected after 10s — killing anyway", flush=True)
+            print("[*] exit_tower: save detected", flush=True)
+            return
+    print("[!] exit_tower: no save detected after 10s", flush=True)
+
+
+def kill_tower():
+    """Kill the Tower process and wait for it to exit."""
+    print("[*] kill_tower: killing process", flush=True)
     subprocess.run(["adb", "shell", "am", "kill", TOWER_PACKAGE],
                    capture_output=True, timeout=5)
     for _ in range(10):
         r = subprocess.run(["adb", "shell", "pidof", TOWER_PACKAGE],
                            capture_output=True, text=True, timeout=5)
         if not r.stdout.strip():
-            print("[*] restart: Tower exited", flush=True)
+            print("[*] kill_tower: Tower exited", flush=True)
             return
         time.sleep(1)
-    print("[!] restart: Tower still running after 10s — continuing anyway", flush=True)
+    print("[!] kill_tower: Tower still running after 10s — continuing anyway", flush=True)
 
 
 def start_tower():
@@ -194,8 +197,9 @@ def wait_for_device(timeout=60):
 def try_gem(img_bgr, tower):
     """
     Return predicted tap position (x, y) if a gem is detected on-orbit,
-    else None. Logs the detection. `tower` is the tower center from
-    find_tower_center (required — callers must gate on tower-found).
+    else None. `tower` is the (cx, cy, ring_r) tuple from find_tower_center.
+    Radius bounds are computed from the orbit ring: min = 5% screen width,
+    max = ring radius.
     """
     g = gem.detect_gem(img_bgr)
     if g is None:
@@ -206,14 +210,15 @@ def try_gem(img_bgr, tower):
 
     dx, dy = cx - tower[0], cy - tower[1]
     radius = (dx * dx + dy * dy) ** 0.5
-    # Observed orbit radii from hit data: ~195-200px (inner phase) and ~245-250px.
-    # Off-orbit detections (r<190 or r>265) accounted for 105/111 logged misses.
-    if not (GEM_RADIUS_MIN <= radius <= GEM_RADIUS_MAX):
-        print(f"[-] gem-shape at ({cx},{cy}) rejected — r={radius:.0f} off-orbit", flush=True)
+    r_min = img_bgr.shape[1] * 0.05
+    r_max = tower[2]
+
+    if not (r_min <= radius <= r_max):
+        print(f"[-] gem-shape at ({cx},{cy}) rejected — r={radius:.0f} off-orbit (tower={tower[0]},{tower[1]} ring_r={tower[2]})", flush=True)
         return None
 
     pred = gem.predict_tap((cx, cy), tower, PIPELINE_LATENCY, period_s=GEM_PERIOD)
-    print(f"[+] gem at ({cx},{cy}) score={score:.2f} r={radius:.0f} → tap ({pred[0]},{pred[1]})", flush=True)
+    print(f"[+] gem at ({cx},{cy}) score={score:.2f} r={radius:.0f} tower=({tower[0]},{tower[1]}) → tap ({pred[0]},{pred[1]})", flush=True)
     return pred, cx, cy, score, radius
 
 
@@ -250,15 +255,18 @@ def log_gem_attempt(img_pil, detected, pred, score, radius,
     if success:
         print(f"[+] gem hit! +{(count_after or 0)-(count_before or 0)} gems in {elapsed_str}s", flush=True)
     else:
-        on_orbit = GEM_RADIUS_MIN <= radius <= GEM_RADIUS_MAX
-        if on_orbit:
-            fp_dir = Path("/backup") / "false_positives"
-            fp_dir.mkdir(exist_ok=True)
-            img_path = fp_dir / f"{ts}_fp.png"
-            img_pil.save(str(img_path))
-            print(f"[!] on-orbit miss logged → {img_path.name}", flush=True)
-        else:
-            print(f"[!] gem miss (off-orbit r={radius:.0f})", flush=True)
+        fp_dir = Path("/backup") / "false_positives"
+        fp_dir.mkdir(exist_ok=True)
+        img_path = fp_dir / f"{ts}_fp.png"
+        ann = img_pil.copy()
+        draw = ImageDraw.Draw(ann)
+        px, py, r = pred[0], pred[1], 60
+        green = (0, 255, 0)
+        draw.line([(px - r, py), (px + r, py)], fill=green, width=2)
+        draw.line([(px, py - r), (px, py + r)], fill=green, width=2)
+        draw.ellipse([(px - r, py - r), (px + r, py + r)], outline=green, width=2)
+        ann.save(str(img_path))
+        print(f"[!] gem miss logged → {img_path.name}", flush=True)
 
 
 def send_retry_webhook(img_pil):
@@ -289,22 +297,25 @@ _item_states = {
     "return_to_game": True,
     "backup":         True,
     "resume_round":   True,
+    "save_game":      False,
     "restart_game":   False,
     "retry_wait":     float(RETRY_WAIT),
     "return_wait":    float(RETURN_WAIT),
 }
 _item_lock = threading.Lock()
+_wakeup = threading.Event()  # set by poll thread on any state change; clears at top of main loop
 
 ITEMS = [
     {"id": "automator",      "type": "toggle",  "desc": "Automator on/off",              "state": "true",             "preserve_state": "true",  "order": "0"},
     {"id": "tower_focus",    "type": "toggle",  "desc": "Require Tower in foreground",   "state": "true",             "preserve_state": "true",  "order": "10"},
-    {"id": "resume_round",   "type": "toggle",  "desc": "Auto-resume / start round",     "state": "true",             "preserve_state": "true",  "order": "20"},
-    {"id": "retry_wait",     "type": "numeric", "desc": "Auto-retry delay (s)",          "state": str(RETRY_WAIT),    "preserve_state": "true",  "order": "25"},
-    {"id": "return_to_game", "type": "toggle",  "desc": "Auto-dismiss return-to-game",   "state": "true",             "preserve_state": "true",  "order": "30"},
-    {"id": "return_wait",    "type": "numeric", "desc": "Return-to-game delay (s)",      "state": str(RETURN_WAIT),   "preserve_state": "true",  "order": "35"},
-    {"id": "claim_click",    "type": "toggle",  "desc": "Claim gem clicking",            "state": "true",             "preserve_state": "true",  "order": "40"},
-    {"id": "gem_click",      "type": "toggle",  "desc": "Floating gem clicking",         "state": "true",             "preserve_state": "true",  "order": "50"},
+    {"id": "resume_round",   "type": "toggle",  "desc": "Start/Resume round",     "state": "true",             "preserve_state": "true",  "order": "20"},
+    {"id": "retry_wait",     "type": "numeric", "desc": "Autostart delay (s)",          "state": str(RETRY_WAIT),    "preserve_state": "true",  "order": "25"},
+    {"id": "return_to_game", "type": "toggle",  "desc": "Return to game (from menus)",   "state": "true",             "preserve_state": "true",  "order": "30"},
+    {"id": "return_wait",    "type": "numeric", "desc": "Return delay (s)",      "state": str(RETURN_WAIT),   "preserve_state": "true",  "order": "35"},
+    {"id": "claim_click",    "type": "toggle",  "desc": "Ad Gem claiming",            "state": "true",             "preserve_state": "true",  "order": "40"},
+    {"id": "gem_click",      "type": "toggle",  "desc": "Floating gem claiming",         "state": "true",             "preserve_state": "true",  "order": "50"},
     {"id": "backup",         "type": "toggle",  "desc": "playerInfo.dat backup",         "state": "true",             "preserve_state": "true",  "order": "60"},
+    {"id": "save_game",      "type": "button",  "desc": "Save game",         "state": "false",                                         "order": "65"},
     {"id": "restart_game",   "type": "button",  "desc": "Restart Tower (graceful)",      "state": "false",                                         "order": "70"},
 ]
 
@@ -348,17 +359,59 @@ def _register_items():
         pass
 
 
+def _do_save():
+    """Save Tower state and return to game: called from poll thread within ~1s of button press."""
+    print("[*] save_game — saving and returning", flush=True)
+    _set_item("save_game", "false")
+    prev_focus = flag("tower_focus")
+    if prev_focus:
+        _set_item("tower_focus", "false")
+    try:
+        exit_tower()
+        start_tower()
+        subprocess.run(["python3", "/backup.py"], check=False)
+    finally:
+        if prev_focus:
+            _set_item("tower_focus", "true")
+    print("[*] save_game complete", flush=True)
+
+
+def _do_restart():
+    """Graceful Tower restart: called from the poll thread within ~1s of button press."""
+    print("[*] restart_game — starting graceful restart", flush=True)
+    _set_item("restart_game", "false")  # acknowledge before the long wait
+    prev_focus = flag("tower_focus")
+    if prev_focus:
+        _set_item("tower_focus", "false")
+    try:
+        exit_tower()
+        kill_tower()
+        start_tower()
+    finally:
+        if prev_focus:
+            _set_item("tower_focus", "true")
+    print("[*] restart_game complete", flush=True)
+
+
 def _poll_items():
     while True:
         try:
             states = requests.get(f"{DROIDCTRL_URL}/item/states", timeout=5).json()
+            changed = False
             with _item_lock:
                 for key, new_val in states.items():
                     if key in _item_states and _item_states[key] != new_val:
                         print(f"[*] item {key}: {_item_states[key]} → {new_val}", flush=True)
+                        changed = True
                     _item_states[key] = new_val
-        except Exception:
-            pass
+            if changed:
+                _wakeup.set()
+            if _item_states.get("save_game"):
+                _do_save()
+            if _item_states.get("restart_game"):
+                _do_restart()
+        except Exception as e:
+            print(f"[!] poll: {e}", flush=True)
         time.sleep(1)
 
 
@@ -378,24 +431,16 @@ def run():
     return_time = 0.0
     last_dat_mtime = 0
     gem_first_seen = None
+    last_gem_tap_time = None
+    status_time = time.monotonic()
+    tower_ticks = 0
+    total_ticks = 0
 
     while True:
+        _wakeup.clear()
         try:
-            if flag("restart_game"):
-                print("[*] restart_game toggled — starting graceful restart", flush=True)
-                prev_focus = flag("tower_focus")
-                if prev_focus:
-                    _set_item("tower_focus", "false")
-                exit_tower()
-                start_tower()
-                if prev_focus:
-                    _set_item("tower_focus", "true")
-                _set_item("restart_game", "false")
-                print("[*] restart_game complete", flush=True)
-                continue
-
             if not flag("automator"):
-                time.sleep(POLL_INTERVAL)
+                _wakeup.wait(timeout=POLL_INTERVAL)
                 continue
 
             if flag("tower_focus") and not is_tower_focused():
@@ -406,42 +451,60 @@ def run():
             tower = gem.find_tower_center(img_bgr)
             img_pil = bgr_to_pil(img_bgr)
 
+            total_ticks += 1
             if tower is not None:
-                result = try_gem(img_bgr, tower) if flag("gem_click") else None
+                tower_ticks += 1
+            now = time.monotonic()
+            if now - status_time >= 300:
+                gem_ago = f"{(now - last_gem_tap_time) / 60:.1f}m ago" if last_gem_tap_time else "never"
+                print(f"[~] tower found {tower_ticks}/{total_ticks} polls | last gem tap: {gem_ago}", flush=True)
+                tower_ticks = 0
+                total_ticks = 0
+                status_time = now
+
+            if tower is not None:
+                result = try_gem(img_bgr, tower)
                 if result:
                     tap_pos, det_x, det_y, det_score, det_r = result
                     if gem_first_seen is None:
                         gem_first_seen = time.monotonic()
                     elapsed = time.monotonic() - gem_first_seen
-                    tap(*tap_pos)
-                    time.sleep(1)
-                    img_after = bgr_to_pil(gem.screencap_raw())
-                    count_before = read_gem_count(img_pil)
-                    count_after = read_gem_count(img_after)
-                    success = (count_before is not None and count_after is not None
-                               and count_after > count_before)
-                    log_gem_attempt(img_pil, (det_x, det_y), tap_pos, det_score, det_r,
-                                    count_before, count_after, elapsed, success)
-                    if success:
-                        gem_first_seen = None
-                    time.sleep(max(0, POLL_INTERVAL - 1))
+                    if flag("gem_click"):
+                        tap(*tap_pos)
+                        time.sleep(1)
+                        img_after = bgr_to_pil(gem.screencap_raw())
+                        count_before = read_gem_count(img_pil)
+                        count_after = read_gem_count(img_after)
+                        success = (count_before is not None and count_after is not None
+                                   and count_after > count_before)
+                        log_gem_attempt(img_pil, (det_x, det_y), tap_pos, det_score, det_r,
+                                        count_before, count_after, elapsed, success)
+                        if success:
+                            gem_first_seen = None
+                            last_gem_tap_time = time.monotonic()
+                    else:
+                        print(f"[.] gem_click off — would tap ({tap_pos[0]},{tap_pos[1]})", flush=True)
+                    _wakeup.wait(timeout=max(0, POLL_INTERVAL - 1))
                     continue
                 else:
                     gem_first_seen = None  # gem gone from orbit
-                claim_pos = ocr_find(img_pil, "claim") if flag("claim_click") else None
+                claim_pos = ocr_find_in_region(img_pil, "claim", y0_frac=0.5, x1_frac=0.5)
                 if claim_pos:
-                    print(f"[+] 'claim' at {claim_pos} — tapping", flush=True)
-                    tap(*claim_pos)
-                    time.sleep(POLL_INTERVAL)
+                    if flag("claim_click"):
+                        print(f"[+] 'claim' at {claim_pos} — tapping", flush=True)
+                        tap(*claim_pos)
+                    else:
+                        print(f"[.] claim_click off — would tap {claim_pos}", flush=True)
+                    _wakeup.wait(timeout=POLL_INTERVAL)
                     continue
             else:
                 print("[-] No tower center found", flush=True)
 
-                resume_pos = ocr_find_in_region(img_pil, "resume", x_frac=0.5, y_frac=0.5) if flag("resume_round") else None
+                resume_pos = ocr_find_in_region(img_pil, "resume", x0_frac=0.5, y0_frac=0.5) if flag("resume_round") else None
                 if resume_pos:
                     print(f"[+] 'Welcome Back' dialog — tapping Resume at {resume_pos}", flush=True)
                     tap(*resume_pos)
-                    time.sleep(POLL_INTERVAL)
+                    _wakeup.wait(timeout=POLL_INTERVAL)
                     continue
 
             # Return-to-game check runs regardless of tower detection (overlay
@@ -458,7 +521,7 @@ def run():
                     return_time = 0.0
                 else:
                     print(f"[-] 'return to game' overlay ({now - return_time:.0f}/{val('return_wait', RETURN_WAIT):.0f}s)", flush=True)
-                time.sleep(POLL_INTERVAL)
+                _wakeup.wait(timeout=POLL_INTERVAL)
                 continue
 
             if return_time != 0.0:
@@ -520,7 +583,7 @@ def run():
         except Exception as e:
             print(f"[!] {e}", flush=True)
 
-        time.sleep(POLL_INTERVAL)
+        _wakeup.wait(timeout=POLL_INTERVAL)
 
 
 if __name__ == "__main__":
