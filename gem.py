@@ -16,6 +16,9 @@ Also provides:
 """
 import math
 import subprocess
+import threading
+import time
+from collections import deque
 
 import cv2
 import numpy as np
@@ -133,6 +136,30 @@ def _interior_magenta_density(mask, pts):
     return int((inter > 0).sum()) / ip
 
 
+def detect_gem_near(img_bgr, predicted_xy, search_r=130):
+    """Lightweight gem locator for tracking: find the magenta centroid
+    within search_r pixels of predicted_xy. Returns (cx, cy, score) or None.
+    Uses blob centroid instead of contour fitting so it works on H.264
+    compressed frames where the gem outline is too fragmented for the
+    full contour-based detector."""
+    px, py = int(predicted_xy[0]), int(predicted_xy[1])
+    H, W = img_bgr.shape[:2]
+    x0, y0 = max(0, px - search_r), max(0, py - search_r)
+    x1, y1 = min(W, px + search_r), min(H, py + search_r)
+    roi = img_bgr[y0:y1, x0:x1]
+    mask = magenta_mask(roi)
+    n = int(np.count_nonzero(mask))
+    if n < 80:
+        return None
+    M = cv2.moments(mask)
+    if M["m00"] == 0:
+        return None
+    cx = int(M["m10"] / M["m00"]) + x0
+    cy = int(M["m01"] / M["m00"]) + y0
+    score = min(1.0, n / 600.0)
+    return cx, cy, score
+
+
 def detect_gem(img_bgr):
     """
     Return (score, cx, cy, side) for the best gem candidate, or None.
@@ -187,7 +214,16 @@ def detect_gem(img_bgr):
 # ---------- tower center ----------
 
 
-def find_tower_center(img_bgr):
+def _ring_mean_brightness(gray, cx, cy, r, n_samples=32):
+    """Sample n_samples pixels on the circumference, return mean grayscale value."""
+    h, w = gray.shape
+    angles = np.linspace(0, 2 * np.pi, n_samples, endpoint=False)
+    xs = np.clip(np.round(cx + r * np.cos(angles)).astype(int), 0, w - 1)
+    ys = np.clip(np.round(cy + r * np.sin(angles)).astype(int), 0, h - 1)
+    return float(gray[ys, xs].mean())
+
+
+def find_tower_center(img_bgr, min_ring_brightness=60):
     """Orbit-ring Hough circle → tower center, or None if not found.
 
     Detects the orbit ring the gem travels along. Color-agnostic (grayscale).
@@ -195,6 +231,10 @@ def find_tower_center(img_bgr):
     midpoint and whose ring fits entirely within the image. Among candidates,
     picks the largest ring (orbit ring dominates). Radius range: 16%–50% of
     screen width.
+
+    The brightness filter rejects decorative background arcs (dark, ~<20 mean)
+    that appear on the game-stats/round-end screen. The real orbit ring glows
+    white/blue and easily clears the default threshold of 60.
     """
     h, w = img_bgr.shape[:2]
     cx_screen = w / 2
@@ -212,6 +252,7 @@ def find_tower_center(img_bgr):
         if abs(c[0] - cx_screen) <= tolerance  # horizontally centered
         and c[2] <= c[0] <= w - c[2]           # fits within image width
         and c[2] <= c[1] <= h - c[2]           # fits within image height
+        and _ring_mean_brightness(gray, c[0], c[1], c[2]) >= min_ring_brightness
     ]
     if not candidates:
         return None
@@ -221,21 +262,24 @@ def find_tower_center(img_bgr):
 
 # ---------- prediction ----------
 
-def predict_tap(gem_xy, tower_xy, latency_s, period_s=12.0, clockwise=True):
+def predict_tap(gem_xy, tower_xy, latency_s, period_s=12.0, omega=None, clockwise=True):
     """
     Extrapolate the gem's position forward by `latency_s` seconds, assuming
     it moves at constant angular velocity along a circle centered on the
     tower. In image coordinates with y pointing down, clockwise motion on
     screen means atan2 angle INCREASES.
+
+    Pass `omega` (rad/s) directly to override the period_s default — used
+    when the caller has measured angular velocity from consecutive frames.
     """
     dx = gem_xy[0] - tower_xy[0]
     dy = gem_xy[1] - tower_xy[1]
     r = math.hypot(dx, dy)
     theta = math.atan2(dy, dx)
-    omega = 2 * math.pi / period_s
+    w = omega if omega is not None else (2 * math.pi / period_s)
     if not clockwise:
-        omega = -omega
-    theta_future = theta + omega * latency_s
+        w = -w
+    theta_future = theta + w * latency_s
     return (
         int(round(tower_xy[0] + r * math.cos(theta_future))),
         int(round(tower_xy[1] + r * math.sin(theta_future))),
@@ -271,3 +315,158 @@ def screencap_raw(adb_cmd=None):
             )
     arr = np.frombuffer(buf[header:header + expected], dtype=np.uint8).reshape(h, w, 4)
     return cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
+
+
+# ---------- live stream reader ----------
+
+class FrameStream:
+    """
+    Connects to the droidctrl WebSocket stream, decodes H.264 via ffmpeg,
+    and keeps only the latest frame in a deque(maxlen=1). Intended for
+    short-lived use during the gem tracking loop.
+
+    Usage:
+        with FrameStream("ws://droidctrl:6080/ws", width, height) as fs:
+            ts, bgr = fs.latest()   # None if no frame yet
+    """
+
+    def __init__(self, ws_url, width, height):
+        self._url = ws_url
+        self._w = width
+        self._h = height
+        self._buf = deque(maxlen=1)
+        self._stop = threading.Event()
+        self._ffmpeg = None
+        self._threads = []
+
+    def __enter__(self):
+        frame_size = self._w * self._h * 3
+        sps_event = threading.Event()
+        # Protected by sps_event: written before set(), read after wait().
+        sps_initial: list[bytes] = []
+
+        def _ws_reader():
+            import websocket
+            # Buffer until SPS NAL (00 00 00 01 67 or 00 00 01 67) —
+            # the start of a clean GOP. Writing mid-stream slices to ffmpeg
+            # before it has SPS/PPS causes "non-existing PPS" decode errors.
+            pre_buf = bytearray()
+            synced = False
+
+            def _has_sps(data):
+                for i in range(len(data) - 4):
+                    # 4-byte start code
+                    if data[i:i+4] == b'\x00\x00\x00\x01' and (data[i+4] & 0x1f) == 7:
+                        return i
+                    # 3-byte start code
+                    if i + 3 < len(data) and data[i:i+3] == b'\x00\x00\x01' and (data[i+3] & 0x1f) == 7:
+                        return i
+                return -1
+
+            def _on_message(ws, msg):
+                nonlocal pre_buf, synced
+                if self._stop.is_set():
+                    ws.close()
+                    return
+                if not isinstance(msg, (bytes, bytearray)):
+                    return  # skip JSON control messages
+                if synced:
+                    if self._ffmpeg is not None:
+                        try:
+                            self._ffmpeg.stdin.write(msg)
+                            self._ffmpeg.stdin.flush()
+                        except (BrokenPipeError, OSError):
+                            ws.close()
+                else:
+                    pre_buf += msg
+                    idx = _has_sps(pre_buf)
+                    if idx >= 0:
+                        synced = True
+                        chunk = bytes(pre_buf[idx:])
+                        print(f"[~] FrameStream: SPS at offset {idx} ({len(chunk)} bytes), starting ffmpeg", flush=True)
+                        sps_initial.append(chunk)
+                        sps_event.set()
+                        pre_buf = bytearray()
+
+            def _on_error(ws, err):
+                if not self._stop.is_set():
+                    print(f"[!] FrameStream WS error: {err}", flush=True)
+
+            ws_app = websocket.WebSocketApp(self._url, on_message=_on_message, on_error=_on_error)
+            ws_app.run_forever()
+            # Signal that no more data is coming (WS closed before SPS found).
+            sps_event.set()
+            try:
+                if self._ffmpeg is not None:
+                    self._ffmpeg.stdin.close()
+            except OSError:
+                pass
+
+        def _frame_reader():
+            while not self._stop.is_set():
+                data = b""
+                while len(data) < frame_size:
+                    try:
+                        chunk = self._ffmpeg.stdout.read(frame_size - len(data))
+                    except OSError:
+                        return
+                    if not chunk:
+                        return
+                    data += chunk
+                arr = np.frombuffer(data, dtype=np.uint8).reshape(self._h, self._w, 3)
+                self._buf.append((time.monotonic(), arr.copy()))
+
+        # Start WS reader first; it buffers until SPS then signals sps_event.
+        t_ws = threading.Thread(target=_ws_reader, daemon=True)
+        t_ws.start()
+        self._threads.append(t_ws)
+
+        # Wait for first SPS before starting ffmpeg so it gets clean input
+        # and doesn't error on "unspecified size" from an empty/mid-stream pipe.
+        if not sps_event.wait(timeout=15):
+            print("[!] FrameStream: timeout waiting for SPS", flush=True)
+            self._stop.set()
+            return self
+
+        if not sps_initial:
+            # WS closed without SPS
+            print("[!] FrameStream: WS closed before SPS received", flush=True)
+            self._stop.set()
+            return self
+
+        self._ffmpeg = subprocess.Popen(
+            [
+                "ffmpeg", "-loglevel", "warning",
+                "-f", "h264",
+                "-i", "pipe:0",
+                "-f", "rawvideo", "-pix_fmt", "bgr24",
+                "-s", f"{self._w}x{self._h}",
+                "pipe:1",
+            ],
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=None,
+        )
+        # Feed the buffered SPS immediately so ffmpeg can parse codec params
+        self._ffmpeg.stdin.write(sps_initial[0])
+        self._ffmpeg.stdin.flush()
+
+        t_fr = threading.Thread(target=_frame_reader, daemon=True)
+        t_fr.start()
+        self._threads.append(t_fr)
+
+        return self
+
+    def latest(self):
+        """Return (timestamp, bgr_array) or None if no frame received yet."""
+        return self._buf[-1] if self._buf else None
+
+    def __exit__(self, *_):
+        self._stop.set()
+        ffmpeg = self._ffmpeg
+        if ffmpeg:
+            ffmpeg.terminate()
+            try:
+                ffmpeg.wait(timeout=3)
+            except subprocess.TimeoutExpired:
+                ffmpeg.kill()

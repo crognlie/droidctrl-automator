@@ -18,6 +18,7 @@ tree sees nothing useful. Text labels OCR cleanly; the gem is a pure
 sprite with no text so it needs shape-based detection.
 """
 import io
+import math
 import os
 import re
 import subprocess
@@ -37,6 +38,11 @@ import gem
 
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
 RETRY_WAIT = int(os.environ.get("RETRY_WAIT", "180"))
+STREAM_URL = os.environ.get("STREAM_URL", "ws://droidctrl:6080/ws?passive=1")
+STREAM_TAP_URL = os.environ.get("STREAM_TAP_URL", "http://droidctrl:6080/tap")
+# Phone resolution — used to size the ffmpeg decoder in FrameStream.
+PHONE_W = int(os.environ.get("SCREEN_WIDTH", "1080"))
+PHONE_H = int(os.environ.get("SCREEN_HEIGHT", "2400"))
 
 RETRY_WEBHOOK = os.environ.get("RETRY_WEBHOOK", "")
 RETRY_WEBHOOK_MESSAGE = os.environ.get(
@@ -48,6 +54,18 @@ RETRY_WEBHOOK_AVATAR = os.environ.get(
     "https://raw.githubusercontent.com/crognlie/droidctrl/main/favicons/droidctrl-64x64.png",
 )
 BACKUP_DIR = os.environ.get("BACKUP_DIR", "")
+try:
+    _st = os.stat("/backup")
+    _backup_uid, _backup_gid = _st.st_uid, _st.st_gid
+except OSError:
+    _backup_uid, _backup_gid = -1, -1
+
+
+def _chown(path):
+    try:
+        os.chown(path, _backup_uid, _backup_gid)
+    except OSError:
+        pass
 RETURN_WAIT = 180  # seconds before auto-tapping "return to game" overlay
 
 PLAYERINFO_SRC = "/sdcard/Android/data/com.TechTreeGames.TheTower/files/playerInfo.dat"
@@ -64,6 +82,52 @@ GEM_PERIOD = float(os.environ.get("GEM_PERIOD", "12.0"))
 # period ≈ 160 px/s on a 1080x2400 frame, so a ~900 ms latency requires
 # predicting ~27° of orbital rotation forward.
 PIPELINE_LATENCY = float(os.environ.get("PIPELINE_LATENCY", "0.9"))
+# Latency for the live-stream tracking path (H.264 frame decode + HTTP tap).
+# Shorter than PIPELINE_LATENCY because stream frames skip the slow ADB screencap step.
+STREAM_LATENCY = float(os.environ.get("STREAM_LATENCY", "0.2"))
+
+# Angular velocity estimate updated from consecutive gem detections.
+# Starts at the GEM_PERIOD default; EMA-smoothed (α=0.25) toward the
+# measured value each time we observe the gem on back-to-back polls.
+_smoothed_omega = 2 * math.pi / GEM_PERIOD  # rad/s
+_last_gem_obs = None  # (angle_rad, monotonic_time) of previous detection
+
+
+def _update_omega(gem_x, gem_y, tower, obs_time):
+    """Update _smoothed_omega from any two gem observations.
+
+    Works across orbit boundaries: N full orbits elapsed between observations
+    is estimated from the current smoothed period, then the total angular
+    displacement (N·2π + fractional remainder) is divided by dt to get the
+    measured omega.
+    """
+    global _smoothed_omega, _last_gem_obs
+    angle = math.atan2(gem_y - tower[1], gem_x - tower[0])
+    if _last_gem_obs is not None:
+        last_angle, last_t = _last_gem_obs
+        dt = obs_time - last_t
+        est_period = 2 * math.pi / _smoothed_omega
+        # Reject if too short (same detection re-processed) or too stale (period
+        # estimate might be too far off to resolve N correctly)
+        if dt >= 2.0 and dt <= est_period * 8:
+            # Number of complete orbits elapsed
+            n_orbits = round(dt / est_period)
+            # Clockwise in screen coords → angle increases; fractional displacement
+            frac = (angle - last_angle) % (2 * math.pi)
+            total_rotation = n_orbits * 2 * math.pi + frac
+            if total_rotation > 0.1:
+                measured = total_rotation / dt
+                # Sanity gate: reject implied period outside 4–30 s
+                if (2 * math.pi / 30) <= measured <= (2 * math.pi / 4):
+                    prev_period = est_period
+                    _smoothed_omega = 0.25 * measured + 0.75 * _smoothed_omega
+                    new_period = 2 * math.pi / _smoothed_omega
+                    print(
+                        f"[~] gem omega: measured={2*math.pi/measured:.1f}s (n={n_orbits}, dt={dt:.0f}s)  "
+                        f"smoothed {prev_period:.1f}s → {new_period:.1f}s",
+                        flush=True,
+                    )
+    _last_gem_obs = (angle, obs_time)
 
 
 def bgr_to_pil(bgr):
@@ -194,46 +258,206 @@ def wait_for_device(timeout=60):
     raise RuntimeError("Timed out waiting for ADB device")
 
 
-def try_gem(img_bgr, tower):
-    """
-    Return predicted tap position (x, y) if a gem is detected on-orbit,
-    else None. `tower` is the (cx, cy, ring_r) tuple from find_tower_center.
-    Radius bounds are computed from the orbit ring: min = 5% screen width,
-    max = ring radius.
-    """
+def detect_on_orbit(img_bgr, tower):
+    """Return (cx, cy, score, radius) if a gem is on-orbit, else None."""
     g = gem.detect_gem(img_bgr)
     if g is None:
         return None
     score, cx, cy, side = g
     if score < GEM_MIN_SCORE:
         return None
-
     dx, dy = cx - tower[0], cy - tower[1]
     radius = (dx * dx + dy * dy) ** 0.5
     r_min = img_bgr.shape[1] * 0.05
     r_max = tower[2]
-
     if not (r_min <= radius <= r_max):
-        print(f"[-] gem-shape at ({cx},{cy}) rejected — r={radius:.0f} off-orbit (tower={tower[0]},{tower[1]} ring_r={tower[2]})", flush=True)
+        print(f"[-] gem-shape at ({cx},{cy}) rejected — r={radius:.0f} off-orbit (ring_r={tower[2]})", flush=True)
         return None
+    return cx, cy, score, radius
 
-    pred = gem.predict_tap((cx, cy), tower, PIPELINE_LATENCY, period_s=GEM_PERIOD)
+
+def try_gem(img_bgr, tower):
+    """Detect gem and return (pred, cx, cy, score, radius) using current _smoothed_omega, or None."""
+    det = detect_on_orbit(img_bgr, tower)
+    if det is None:
+        return None
+    cx, cy, score, radius = det
+    pred = gem.predict_tap((cx, cy), tower, PIPELINE_LATENCY, omega=_smoothed_omega)
     print(f"[+] gem at ({cx},{cy}) score={score:.2f} r={radius:.0f} tower=({tower[0]},{tower[1]}) → tap ({pred[0]},{pred[1]})", flush=True)
     return pred, cx, cy, score, radius
 
 
+def _stream_tap(x, y):
+    """Fire a tap via the stream server's HTTP endpoint (non-blocking) and return the request time."""
+    t = time.monotonic()
+    try:
+        requests.get(STREAM_TAP_URL, params={"x": x, "y": y}, timeout=2)
+    except Exception as e:
+        print(f"[!] stream tap failed: {e}", flush=True)
+    return t
+
+
+def gem_tracking_loop(first_img_bgr, first_tower, first_det, loop_start):
+    """
+    Rapid tracking loop using the live H.264 stream for low-latency frames.
+    Connects to STREAM_URL (WebSocket) only for the duration of this loop.
+
+    Uses position-assisted detection (orbit-predicted search window + magenta
+    centroid) rather than the full contour detector because H.264 compression
+    fragments the gem outline, breaking contour-based scoring.
+
+    Taps after first frame where we have a confirmed gem position and omega.
+    Exits after 4 consecutive frames with no gem.
+    """
+    global _smoothed_omega, _last_gem_obs
+
+    cx0, cy0, score0, r0 = first_det
+    tower_cx, tower_cy, ring_r = first_tower
+    prev_angle = math.atan2(cy0 - tower_cy, cx0 - tower_cx)
+    prev_time = time.monotonic()
+    prev_r = r0
+
+    miss_streak = 0
+    last_frame_ts = None
+    last_tap_time = None
+    loop_deadline = time.monotonic() + 30.0
+
+    with gem.FrameStream(STREAM_URL, PHONE_W, PHONE_H) as fs:
+        print(f"[~] gem tracking: stream connected", flush=True)
+        deadline = time.monotonic() + 10.0
+        while fs.latest() is None and time.monotonic() < deadline:
+            time.sleep(0.05)
+        if fs.latest() is None:
+            print("[!] gem tracking: no frames from stream after 10s — falling back to ADB", flush=True)
+            return
+
+        first_lock = False  # True after first successful gem detection
+
+        while True:
+            if time.monotonic() > loop_deadline:
+                print("[~] gem tracking: 30s limit reached — exiting", flush=True)
+                return
+
+            frame = fs.latest()
+            if frame is None:
+                time.sleep(0.02)
+                continue
+
+            ts, img_bgr = frame
+            if ts == last_frame_ts:
+                time.sleep(0.01)
+                continue
+            last_frame_ts = ts
+
+            dt = ts - prev_time
+
+            # Predict gem's current position along the orbit using smoothed omega.
+            pred_angle = prev_angle + _smoothed_omega * dt
+            pred_cx = int(tower_cx + prev_r * math.cos(pred_angle))
+            pred_cy = int(tower_cy + prev_r * math.sin(pred_angle))
+
+            # Detect via magenta centroid near predicted position — works on
+            # H.264 frames where the contour is too fragmented for detect_gem.
+            # Use a wider window before first lock-on to absorb startup timing
+            # uncertainty (stream setup delay can shift the gem by 100-200px).
+            search_r = 130 if first_lock else 250
+            det = gem.detect_gem_near(img_bgr, (pred_cx, pred_cy), search_r=search_r)
+
+            img_pil = bgr_to_pil(img_bgr)
+            count = read_gem_count(img_pil)
+
+            if det is None:
+                miss_streak += 1
+                print(f"[~] gem tracking: no gem ({miss_streak}/4) pred=({pred_cx},{pred_cy}) count={count}", flush=True)
+                if miss_streak >= 4:
+                    return
+                # Advance prediction so the next frame's window stays on-orbit.
+                prev_angle = pred_angle
+                prev_time = ts
+                continue
+
+            miss_streak = 0
+            first_lock = True
+            cx, cy, det_score = det
+            angle = math.atan2(cy - tower_cy, cx - tower_cx)
+            radius = math.hypot(cx - tower_cx, cy - tower_cy)
+
+            # Update omega from consecutive detections.
+            if dt > 0.02:
+                delta = (angle - prev_angle) % (2 * math.pi)
+                if 0.01 < delta < math.pi:  # sane range: <180° per frame
+                    measured = delta / dt
+                    if (2 * math.pi / 30) <= measured <= (2 * math.pi / 4):
+                        _smoothed_omega = 0.3 * measured + 0.7 * _smoothed_omega
+                        _last_gem_obs = (angle, ts)
+                        print(
+                            f"[~] gem tracking: dt={dt:.3f}s Δ={math.degrees(delta):.1f}° "
+                            f"→ period={2*math.pi/_smoothed_omega:.2f}s count={count}",
+                            flush=True,
+                        )
+
+            prev_angle = angle
+            prev_time = ts
+            prev_r = radius
+
+            # Skip tap if we fired one recently (wait ~80% of one orbit period to avoid
+            # re-tapping before the previous tap has had time to register).
+            orbit_period = 2 * math.pi / _smoothed_omega
+            if last_tap_time is not None and (ts - last_tap_time) < orbit_period * 0.8:
+                continue
+
+            # Tap: predict where the gem will be after stream pipeline latency.
+            # STREAM_LATENCY is shorter than PIPELINE_LATENCY because stream frames
+            # skip the slow ADB screencap step (~0.8s saved).
+            tap_pos = gem.predict_tap((cx, cy), (tower_cx, tower_cy),
+                                     STREAM_LATENCY, omega=_smoothed_omega)
+            elapsed = ts - loop_start
+            print(
+                f"[+] gem tracking tap: ({cx},{cy}) → ({tap_pos[0]},{tap_pos[1]}) "
+                f"period={orbit_period:.2f}s count={count}",
+                flush=True,
+            )
+            _stream_tap(*tap_pos)
+            last_tap_time = time.monotonic()
+            # Wait 2s for tap to land and any gem-collection animation to settle,
+            # then read count_after from a stream frame.
+            time.sleep(2.0)
+            count_after = None
+            for _ in range(4):  # up to ~2s more if first read fails
+                frame2 = fs.latest()
+                if frame2 is not None:
+                    count_after = read_gem_count(bgr_to_pil(frame2[1]))
+                    if count_after is not None:
+                        break
+                time.sleep(0.5)
+            # Floating gem gives +2. Accept +1 or +2 only; larger jumps are
+            # coincidental CLAIM rewards landing in the count-after window.
+            delta = (count_after - count) if (count is not None and count_after is not None) else None
+            success = delta in (1, 2)
+            print(
+                f"[{'hit' if success else 'miss'}] gem tracking: count {count}→{count_after}",
+                flush=True,
+            )
+            log_gem_attempt(img_pil, (cx, cy), tap_pos, det_score, radius,
+                            count, count_after, elapsed, success)
+            if success:
+                return
+            # Miss: keep tracking and try again on the next orbit.
+
+
 def read_gem_count(img_pil):
     """Read the floating gem count (3rd stat row, upper-left). Returns int or None."""
-    arr = np.array(img_pil)
-    # The number is white text — isolate near-white pixels to cut through the background
-    mask = (arr[:, :, 0] > 180) & (arr[:, :, 1] > 180) & (arr[:, :, 2] > 180)
-    white = np.zeros_like(arr)
-    white[mask] = 255
-    crop = Image.fromarray(white).crop((30, 330, 200, 370))
-    crop = crop.resize((crop.width * 4, crop.height * 4), Image.LANCZOS)
-    text = pytesseract.image_to_string(crop, config="--psm 7 digits").strip()
+    # Tight single-row crop at the gem count line (y≈332 in active gameplay).
+    # PSM 7 (single text line) avoids picking up neighbouring stats.
+    crop = img_pil.crop((30, 315, 500, 370))
+    crop = crop.resize((crop.width * 3, crop.height * 3), Image.LANCZOS)
+    text = pytesseract.image_to_string(crop, config="--psm 11").strip()
     m = re.search(r"\d+", text)
-    return int(m.group()) if m else None
+    if not m:
+        return None
+    val = int(m.group())
+    # Sanity-check: gem count is a plain integer ≤ 999999; reject if implausibly large.
+    return val if val <= 999_999 else None
 
 
 def log_gem_attempt(img_pil, detected, pred, score, radius,
@@ -252,11 +476,13 @@ def log_gem_attempt(img_pil, detected, pred, score, radius,
     log_path = Path("/backup") / "gem_taps.log"
     with open(log_path, "a") as f:
         f.write(line)
+    _chown(log_path)
     if success:
         print(f"[+] gem hit! +{(count_after or 0)-(count_before or 0)} gems in {elapsed_str}s", flush=True)
     else:
         fp_dir = Path("/backup") / "false_positives"
         fp_dir.mkdir(exist_ok=True)
+        _chown(fp_dir)
         img_path = fp_dir / f"{ts}_fp.png"
         ann = img_pil.copy()
         draw = ImageDraw.Draw(ann)
@@ -266,6 +492,7 @@ def log_gem_attempt(img_pil, detected, pred, score, radius,
         draw.line([(px, py - r), (px, py + r)], fill=green, width=2)
         draw.ellipse([(px - r, py - r), (px + r, py + r)], outline=green, width=2)
         ann.save(str(img_path))
+        _chown(img_path)
         print(f"[!] gem miss logged → {img_path.name}", flush=True)
 
 
@@ -457,7 +684,9 @@ def run():
             now = time.monotonic()
             if now - status_time >= 300:
                 gem_ago = f"{(now - last_gem_tap_time) / 60:.1f}m ago" if last_gem_tap_time else "never"
-                print(f"[~] tower found {tower_ticks}/{total_ticks} polls | last gem tap: {gem_ago}", flush=True)
+                gem_count = read_gem_count(img_pil)
+                count_str = f" | gems: {gem_count}" if gem_count is not None else ""
+                print(f"[~] tower found {tower_ticks}/{total_ticks} polls | last gem tap: {gem_ago}{count_str}", flush=True)
                 tower_ticks = 0
                 total_ticks = 0
                 status_time = now
@@ -466,36 +695,35 @@ def run():
                 result = try_gem(img_bgr, tower)
                 if result:
                     tap_pos, det_x, det_y, det_score, det_r = result
+                    _update_omega(det_x, det_y, tower, time.monotonic())
                     if gem_first_seen is None:
                         gem_first_seen = time.monotonic()
-                    elapsed = time.monotonic() - gem_first_seen
                     if flag("gem_click"):
-                        tap(*tap_pos)
-                        time.sleep(1)
-                        img_after = bgr_to_pil(gem.screencap_raw())
-                        count_before = read_gem_count(img_pil)
-                        count_after = read_gem_count(img_after)
-                        success = (count_before is not None and count_after is not None
-                                   and count_after > count_before)
-                        log_gem_attempt(img_pil, (det_x, det_y), tap_pos, det_score, det_r,
-                                        count_before, count_after, elapsed, success)
-                        if success:
-                            gem_first_seen = None
-                            last_gem_tap_time = time.monotonic()
+                        gem_tracking_loop(
+                            img_bgr, tower,
+                            (det_x, det_y, det_score, det_r),
+                            gem_first_seen,
+                        )
+                        gem_first_seen = None
+                        last_gem_tap_time = time.monotonic()
                     else:
-                        print(f"[.] gem_click off — would tap ({tap_pos[0]},{tap_pos[1]})", flush=True)
-                    _wakeup.wait(timeout=max(0, POLL_INTERVAL - 1))
+                        print(f"[.] gem_click off — would track gem at ({det_x},{det_y})", flush=True)
+                        _wakeup.wait(timeout=max(0, POLL_INTERVAL - 1))
                     continue
                 else:
-                    gem_first_seen = None  # gem gone from orbit
+                    gem_first_seen = None
                 claim_pos = ocr_find_in_region(img_pil, "claim", y0_frac=0.5, x1_frac=0.5)
                 if claim_pos:
                     if flag("claim_click"):
-                        print(f"[+] 'claim' at {claim_pos} — tapping", flush=True)
+                        count_before = read_gem_count(img_pil)
                         tap(*claim_pos)
+                        time.sleep(1)
+                        count_after = read_gem_count(bgr_to_pil(gem.screencap_raw()))
+                        delta = (f"+{count_after - count_before}" if (count_before is not None and count_after is not None) else "?")
+                        print(f"[+] 'claim' at {claim_pos} — tapping ({count_before}→{count_after}, {delta})", flush=True)
                     else:
                         print(f"[.] claim_click off — would tap {claim_pos}", flush=True)
-                    _wakeup.wait(timeout=POLL_INTERVAL)
+                    _wakeup.wait(timeout=max(0, POLL_INTERVAL - 1))
                     continue
             else:
                 print("[-] No tower center found", flush=True)

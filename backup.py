@@ -7,6 +7,8 @@ import sys
 import tempfile
 from datetime import datetime
 
+import requests
+
 SRC = "/sdcard/Android/data/com.TechTreeGames.TheTower/files/playerInfo.dat"
 DST_DAT = "/backup/playerInfo.dat"
 
@@ -51,6 +53,23 @@ try:
     shutil.copy2(DST_DAT, daily_dat)
     chown(daily_dat)
     print(f"[*] playerInfo.dat changed — backed up → also {datestamp}", flush=True)
+
+    webhook = os.environ.get("BACKUP_WEBHOOK", "")
+    if webhook:
+        print(f"[*] backup webhook: POSTing playerInfo.dat to {webhook}", flush=True)
+        try:
+            with open(DST_DAT, "rb") as f:
+                resp = requests.post(
+                    webhook,
+                    files={"file": ("playerInfo.dat", f, "application/octet-stream")},
+                    timeout=15,
+                )
+            if resp.ok:
+                print(f"[*] backup webhook: OK {resp.status_code}", flush=True)
+            else:
+                print(f"[!] backup webhook: {resp.status_code} {resp.text[:200]}", flush=True)
+        except Exception as e:
+            print(f"[!] backup webhook: failed — {e}", flush=True)
 finally:
     if os.path.exists(tmp_path):
         os.unlink(tmp_path)
