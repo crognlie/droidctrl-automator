@@ -247,6 +247,25 @@ def start_tower():
     print("[!] restart: Tower didn't focus within 15s", flush=True)
 
 
+_PLAYSTORE_CROP = (540, 635, 1040, 715)  # right-button row on The Tower's Play Store page
+
+
+def _read_playstore_button(img_pil):
+    """Return (text, tap_x, tap_y) for the right action button, or (None, None, None)."""
+    cx0, cy0 = _PLAYSTORE_CROP[0], _PLAYSTORE_CROP[1]
+    crop = img_pil.crop(_PLAYSTORE_CROP)
+    crop = ImageEnhance.Contrast(crop).enhance(3)
+    data = pytesseract.image_to_data(crop, config="--psm 11", output_type=pytesseract.Output.DICT)
+    for i, word in enumerate(data["text"]):
+        w = word.strip().lower()
+        if w in ("update", "play", "open"):
+            x, y, bw, bh = data["left"][i], data["top"][i], data["width"][i], data["height"][i]
+            tap_x = cx0 + x + bw // 2
+            tap_y = cy0 + y + bh // 2
+            return word.strip(), tap_x, tap_y
+    return None, None, None
+
+
 def check_and_install_update():
     """Open Play Store page for The Tower; if Update button is present, tap it and wait for install."""
     print("[*] update check: opening Play Store", flush=True)
@@ -256,28 +275,24 @@ def check_and_install_update():
     time.sleep(4)
 
     img = bgr_to_pil(gem.screencap_raw())
-    crop = img.crop((540, 635, 1040, 715))
-    crop = ImageEnhance.Contrast(crop).enhance(3)
-    text = pytesseract.image_to_string(crop, config="--psm 11").strip().lower()
-    print(f"[*] update check: button text = '{text}'", flush=True)
+    btn_text, tap_x, tap_y = _read_playstore_button(img)
+    print(f"[*] update check: button='{btn_text}' at ({tap_x},{tap_y})", flush=True)
 
-    if "update" not in text:
+    if btn_text is None or btn_text.lower() != "update":
         print("[*] update check: no update available", flush=True)
         return
 
-    print("[*] update check: Update button found — tapping", flush=True)
-    subprocess.run(["adb", "shell", "input", "tap", "788", "672"],
+    print(f"[*] update check: tapping Update at ({tap_x},{tap_y})", flush=True)
+    subprocess.run(["adb", "shell", "input", "tap", str(tap_x), str(tap_y)],
                    capture_output=True, timeout=5)
 
     # Wait up to 5 minutes for the button to change from Update → Play/Open
     for i in range(60):
         time.sleep(5)
         img = bgr_to_pil(gem.screencap_raw())
-        crop = img.crop((540, 635, 1040, 715))
-        crop = ImageEnhance.Contrast(crop).enhance(3)
-        btn = pytesseract.image_to_string(crop, config="--psm 11").strip().lower()
-        print(f"[*] update check: waiting for install ({i*5}s)… button='{btn}'", flush=True)
-        if "update" not in btn and ("play" in btn or "open" in btn):
+        btn_text, tap_x, tap_y = _read_playstore_button(img)
+        print(f"[*] update check: waiting for install ({i*5}s)… button='{btn_text}'", flush=True)
+        if btn_text is not None and btn_text.lower() in ("play", "open"):
             print("[*] update check: install complete", flush=True)
             return
 
