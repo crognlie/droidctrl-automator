@@ -38,6 +38,7 @@ import gem
 
 POLL_INTERVAL = int(os.environ.get("POLL_INTERVAL", "10"))
 RETRY_WAIT = int(os.environ.get("RETRY_WAIT", "180"))
+UPDATE_TIMEOUT = int(os.environ.get("UPDATE_TIMEOUT", str(6 * 24 * 3600)))
 STREAM_URL = os.environ.get("STREAM_URL", "ws://droidctrl:6080/ws?passive=1")
 STREAM_TAP_URL = os.environ.get("STREAM_TAP_URL", "http://droidctrl:6080/tap")
 # Phone resolution — used to size the ffmpeg decoder in FrameStream.
@@ -740,6 +741,7 @@ def run():
     gem_first_seen = None
     last_gem_tap_time = None
     status_time = time.monotonic()
+    update_timer = time.monotonic()
     tower_ticks = 0
     total_ticks = 0
 
@@ -766,7 +768,9 @@ def run():
                 gem_ago = f"{(now - last_gem_tap_time) / 60:.1f}m ago" if last_gem_tap_time else "never"
                 gem_count = read_gem_count(img_pil)
                 count_str = f" | gems: {gem_count}" if gem_count is not None else ""
-                print(f"[~] tower found {tower_ticks}/{total_ticks} polls | last gem tap: {gem_ago}{count_str}", flush=True)
+                update_age_d = (now - update_timer) / 86400
+                update_str = f" | update check: {update_age_d:.1f}d/{UPDATE_TIMEOUT/86400:.0f}d"
+                print(f"[~] tower found {tower_ticks}/{total_ticks} polls | last gem tap: {gem_ago}{count_str}{update_str}", flush=True)
                 tower_ticks = 0
                 total_ticks = 0
                 status_time = now
@@ -862,9 +866,18 @@ def run():
                                     flush=True,
                                 )
                         elif auto_retry and now - retry_time >= val("retry_wait", RETRY_WAIT):
-                            print(f"[+] 'retry' at {retry_pos} — tapping after {now - retry_time:.0f}s", flush=True)
-                            tap(*retry_pos)
-                            retry_time = 0.0
+                            if now - update_timer >= UPDATE_TIMEOUT:
+                                days = (now - update_timer) / 86400
+                                print(f"[*] update timer: {days:.1f}d elapsed — checking Play Store before new round", flush=True)
+                                check_and_install_update()
+                                kill_tower()
+                                start_tower()
+                                update_timer = time.monotonic()
+                                retry_time = 0.0
+                            else:
+                                print(f"[+] 'retry' at {retry_pos} — tapping after {now - retry_time:.0f}s", flush=True)
+                                tap(*retry_pos)
+                                retry_time = 0.0
                         else:
                             print(
                                 f"[-] 'retry' found — {'waiting' if auto_retry else 'auto-resume off'} ({now - retry_time:.0f}/{val("retry_wait", RETRY_WAIT):.0f}s)",
