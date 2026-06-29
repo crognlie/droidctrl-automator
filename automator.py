@@ -32,7 +32,7 @@ import requests
 import cv2
 import numpy as np
 import pytesseract
-from PIL import Image, ImageDraw, ImageFilter
+from PIL import Image, ImageDraw, ImageEnhance, ImageFilter
 
 import gem
 
@@ -245,6 +245,43 @@ def start_tower():
             return
         time.sleep(1)
     print("[!] restart: Tower didn't focus within 15s", flush=True)
+
+
+def check_and_install_update():
+    """Open Play Store page for The Tower; if Update button is present, tap it and wait for install."""
+    print("[*] update check: opening Play Store", flush=True)
+    subprocess.run(["adb", "shell", "am", "start", "-a", "android.intent.action.VIEW",
+                    "-d", "market://details?id=com.TechTreeGames.TheTower"],
+                   capture_output=True, timeout=5)
+    time.sleep(4)
+
+    img = bgr_to_pil(gem.screencap_raw())
+    crop = img.crop((540, 635, 1040, 715))
+    crop = ImageEnhance.Contrast(crop).enhance(3)
+    text = pytesseract.image_to_string(crop, config="--psm 11").strip().lower()
+    print(f"[*] update check: button text = '{text}'", flush=True)
+
+    if "update" not in text:
+        print("[*] update check: no update available", flush=True)
+        return
+
+    print("[*] update check: Update button found — tapping", flush=True)
+    subprocess.run(["adb", "shell", "input", "tap", "788", "672"],
+                   capture_output=True, timeout=5)
+
+    # Wait up to 5 minutes for the button to change from Update → Play/Open
+    for i in range(60):
+        time.sleep(5)
+        img = bgr_to_pil(gem.screencap_raw())
+        crop = img.crop((540, 635, 1040, 715))
+        crop = ImageEnhance.Contrast(crop).enhance(3)
+        btn = pytesseract.image_to_string(crop, config="--psm 11").strip().lower()
+        print(f"[*] update check: waiting for install ({i*5}s)… button='{btn}'", flush=True)
+        if "update" not in btn and ("play" in btn or "open" in btn):
+            print("[*] update check: install complete", flush=True)
+            return
+
+    print("[!] update check: timed out waiting for install", flush=True)
 
 
 def wait_for_device(timeout=60):
@@ -639,6 +676,7 @@ def _do_restart():
         _set_item("tower_focus", "false")
     try:
         exit_tower()
+        check_and_install_update()
         kill_tower()
         start_tower()
     finally:
