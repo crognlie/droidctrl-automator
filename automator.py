@@ -332,6 +332,7 @@ def gem_tracking_loop(first_img_bgr, first_tower, first_det, loop_start):
             return
 
         first_lock = False  # True after first successful gem detection
+        last_tower_check = time.monotonic()
 
         while True:
             if time.monotonic() > loop_deadline:
@@ -348,6 +349,17 @@ def gem_tracking_loop(first_img_bgr, first_tower, first_det, loop_start):
                 time.sleep(0.01)
                 continue
             last_frame_ts = ts
+
+            # detect_gem_near has no shape filter — it'll happily latch onto any
+            # magenta-ish UI (e.g. the Perks-selection modal's purple rows) if the
+            # orbit ring disappears mid-track. Re-check the ring periodically and
+            # bail rather than blind-tap for up to 30s more.
+            now_mono = time.monotonic()
+            if now_mono - last_tower_check >= 0.3:
+                last_tower_check = now_mono
+                if gem.find_tower_center(img_bgr) is None:
+                    print("[~] gem tracking: tower lost (menu/modal?) — aborting tracking", flush=True)
+                    return
 
             dt = ts - prev_time
 
@@ -376,11 +388,26 @@ def gem_tracking_loop(first_img_bgr, first_tower, first_det, loop_start):
                 prev_time = ts
                 continue
 
+            cx, cy, det_score = det
+            radius = math.hypot(cx - tower_cx, cy - tower_cy)
+
+            # detect_gem_near has no shape filter, so a stray magenta-ish UI
+            # element (e.g. the top "View Perks" bar) can get accepted as the
+            # gem. Reject anything outside the orbit ring — real gem hits are
+            # never seen past ring_r (empirically maxes out well under it).
+            if not (PHONE_W * 0.05 <= radius <= ring_r):
+                miss_streak += 1
+                print(f"[~] gem tracking: off-orbit detection ({cx},{cy}) r={radius:.0f} "
+                      f"outside ring_r={ring_r} — ignoring ({miss_streak}/4)", flush=True)
+                if miss_streak >= 4:
+                    return
+                prev_angle = pred_angle
+                prev_time = ts
+                continue
+
             miss_streak = 0
             first_lock = True
-            cx, cy, det_score = det
             angle = math.atan2(cy - tower_cy, cx - tower_cx)
-            radius = math.hypot(cx - tower_cx, cy - tower_cy)
 
             # Update omega from consecutive detections.
             if dt > 0.02:
