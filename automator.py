@@ -54,6 +54,8 @@ RETRY_WEBHOOK_AVATAR = os.environ.get(
     "RETRY_WEBHOOK_AVATAR",
     "https://raw.githubusercontent.com/crognlie/droidctrl/main/favicons/droidctrl-64x64.png",
 )
+UPDATE_WEBHOOK = os.environ.get("UPDATE_WEBHOOK", "")
+UPDATE_WEBHOOK_AVATAR = os.environ.get("UPDATE_WEBHOOK_AVATAR", RETRY_WEBHOOK_AVATAR)
 BACKUP_DIR = os.environ.get("BACKUP_DIR", "")
 try:
     _st = os.stat("/backup")
@@ -267,6 +269,30 @@ def _read_playstore_button(img_pil):
     return None, None, None
 
 
+def _save_update_check_shot(img_pil, label, tap_xy=None):
+    """Save a screenshot of an update-check step to /backup/update_check/ for verification.
+    Annotates the detected tap point (if any) and the OCR crop box."""
+    if not BACKUP_DIR:
+        return
+    shot_dir = Path("/backup") / "update_check"
+    shot_dir.mkdir(exist_ok=True)
+    _chown(shot_dir)
+    ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+    ann = img_pil.copy()
+    draw = ImageDraw.Draw(ann)
+    draw.rectangle(_PLAYSTORE_CROP, outline=(0, 255, 255), width=2)
+    if tap_xy is not None:
+        px, py = tap_xy
+        r = 30
+        draw.line([(px - r, py), (px + r, py)], fill=(0, 255, 0), width=2)
+        draw.line([(px, py - r), (px, py + r)], fill=(0, 255, 0), width=2)
+        draw.ellipse([(px - r, py - r), (px + r, py + r)], outline=(0, 255, 0), width=2)
+    img_path = shot_dir / f"{ts}_{label}.png"
+    ann.save(str(img_path))
+    _chown(img_path)
+    print(f"[*] update check: saved {img_path.name}", flush=True)
+
+
 def check_and_install_update():
     """Open Play Store page for The Tower; if Update button is present, tap it and wait for install."""
     print("[*] update check: opening Play Store", flush=True)
@@ -278,12 +304,15 @@ def check_and_install_update():
     img = bgr_to_pil(gem.screencap_raw())
     btn_text, tap_x, tap_y = _read_playstore_button(img)
     print(f"[*] update check: button='{btn_text}' at ({tap_x},{tap_y})", flush=True)
+    tap_xy = (tap_x, tap_y) if tap_x is not None else None
+    _save_update_check_shot(img, "opened", tap_xy)
 
     if btn_text is None or btn_text.lower() != "update":
         print("[*] update check: no update available", flush=True)
         return
 
-    print(f"[*] update check: tapping Update at ({tap_x},{tap_y})", flush=True)
+    old_version = get_tower_version()
+    print(f"[*] update check: tapping Update at ({tap_x},{tap_y}) — current version {old_version}", flush=True)
     subprocess.run(["adb", "shell", "input", "tap", str(tap_x), str(tap_y)],
                    capture_output=True, timeout=5)
 
@@ -293,11 +322,18 @@ def check_and_install_update():
         img = bgr_to_pil(gem.screencap_raw())
         btn_text, tap_x, tap_y = _read_playstore_button(img)
         print(f"[*] update check: waiting for install ({i*5}s)… button='{btn_text}'", flush=True)
+        if i % 6 == 0:  # ~every 30s, avoid flooding /backup with 60 near-identical shots
+            _save_update_check_shot(img, f"installing_{i*5}s",
+                                     (tap_x, tap_y) if tap_x is not None else None)
         if btn_text is not None and btn_text.lower() in ("play", "open"):
-            print("[*] update check: install complete", flush=True)
+            new_version = get_tower_version()
+            print(f"[*] update check: install complete — now version {new_version}", flush=True)
+            _save_update_check_shot(img, "install_complete", (tap_x, tap_y))
+            send_update_webhook(old_version, new_version, img)
             return
 
     print("[!] update check: timed out waiting for install", flush=True)
+    _save_update_check_shot(img, "timed_out")
 
 
 def wait_for_device(timeout=60):
@@ -576,6 +612,33 @@ def log_gem_attempt(img_pil, detected, pred, score, radius,
         print(f"[!] gem miss logged → {img_path.name}", flush=True)
 
 
+def get_tower_version():
+    """Return the installed Tower app's versionName (e.g. '28.3.2'), or None."""
+    r = subprocess.run(["adb", "shell", "dumpsys", "package", TOWER_PACKAGE],
+                       capture_output=True, text=True, timeout=5)
+    m = re.search(r"versionName=(\S+)", r.stdout)
+    return m.group(1) if m else None
+
+
+def send_update_webhook(old_version, new_version, img_pil=None):
+    if not UPDATE_WEBHOOK:
+        return
+    msg = f"The Tower updated: {old_version or '?'} → {new_version or '?'}"
+    try:
+        kwargs = dict(
+            data={"content": msg, "avatar_url": UPDATE_WEBHOOK_AVATAR},
+            timeout=10,
+        )
+        if img_pil is not None:
+            buf = io.BytesIO()
+            img_pil.save(buf, format="PNG")
+            buf.seek(0)
+            kwargs["files"] = {"file": ("screenshot.png", buf, "image/png")}
+        requests.post(UPDATE_WEBHOOK, **kwargs)
+    except Exception as e:
+        print(f"[!] update webhook failed: {e}", flush=True)
+
+
 def send_retry_webhook(img_pil):
     if not RETRY_WEBHOOK:
         return
@@ -741,7 +804,9 @@ def run():
     gem_first_seen = None
     last_gem_tap_time = None
     status_time = time.monotonic()
-    update_timer = time.monotonic()
+    # Expired on start so the first round end after a (re)start always
+    # triggers an update check; subsequent checks follow UPDATE_TIMEOUT.
+    update_timer = time.monotonic() - UPDATE_TIMEOUT
     tower_ticks = 0
     total_ticks = 0
 
@@ -819,8 +884,17 @@ def run():
                     _wakeup.wait(timeout=POLL_INTERVAL)
                     continue
 
-            # Return-to-game check runs regardless of tower detection (overlay
-            # can appear even when a false-positive tower is detected)
+            # Main-menu "BATTLE" button and return-to-game overlay both run
+            # regardless of tower detection — circular main-menu UI elements
+            # (logo, icons) can trigger a false-positive tower ring detection,
+            # so these can't be gated behind "tower is None".
+            battle_pos = ocr_find_in_region(img_pil, "battle", y0_frac=0.6) if flag("resume_round") else None
+            if battle_pos:
+                print(f"[+] 'BATTLE' button found — tapping at {battle_pos}", flush=True)
+                tap(*battle_pos)
+                _wakeup.wait(timeout=POLL_INTERVAL)
+                continue
+
             return_pos = ocr_find(img_pil, "return") if flag("return_to_game") else None
             if return_pos:
                 now = time.monotonic()
